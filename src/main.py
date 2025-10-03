@@ -26,9 +26,18 @@ import random
 import argparse
 import asyncio
 from typing import Optional, Dict, Any, Tuple
+from kafka import KafkaConsumer,KafkaProducer
+from datetime import datetime, timezone
 
 import requests
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout, Page, Browser
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "192.168.1.28:9092")
+KAFKA_TOPIC     = os.getenv("KAFKA_TOPIC", "tiktok-platforms")
+KAFKA_GROUP_ID  = os.getenv("KAFKA_GROUP_ID", "tiktok-comment-bot")
+
+PRODUCER_SUCCESS_TOPIC = os.getenv("PRODUCER_SUCCESS_TOPIC", "comment_jobs_success")
+PRODUCER_ERROR_TOPIC   = os.getenv("PRODUCER_ERROR_TOPIC", "comment_jobs_error")
+
 
 # ----------------------- Config -----------------------
 GPM_URL = os.getenv("GPM_URL", "http://127.0.0.1:19995")
@@ -333,12 +342,260 @@ async def dismiss_overlays(page: Page) -> None:
         except Exception:
             pass
 
-if __name__ == "__main__":
-    # ⚠️ Điền cứng thông tin mặc định vào đây
-    profile_id = "ddfdc3df-8a2f-40b4-b1ef-933b1802411d"
-    video_url  = "https://www.tiktok.com/@elz.study/video/7554793319776128263"
-    comment    = "bóng đèn sáng hết hạn sử dụng"
-    max_retries = 2
-    wait_login  = 90
+async def process_one_video_with_comments(page: Page, video_url: str, comments: list, wait_login_sec: int, max_retries: int):
+    """Mở 1 video và lần lượt gửi toàn bộ comments trong list (theo thứ tự)."""
+    # đảm bảo login (làm 1 lần cho phiên)
+    await page.goto(TT_BASE, wait_until="domcontentloaded")
+    if not await ensure_logged_in(page):
+        print(f"[!] Not logged in. Opening /login and waiting {wait_login_sec}s...")
+        await page.goto("https://www.tiktok.com/login", wait_until="domcontentloaded")
+        await page.wait_for_timeout(wait_login_sec * 1000)
 
-    asyncio.run(run(profile_id, video_url, comment, max_retries, wait_login))
+    # mở video
+    await open_video(page, video_url)
+
+    for comment_text in comments:
+        tries = 0
+        while tries <= max_retries:
+            tries += 1
+            print(f"[*] Attempt {tries}/{max_retries + 1} | {video_url} | {comment_text!r}")
+            try:
+                await type_comment(page, comment_text)
+                await submit_comment(page)
+                ok = await confirm_posted(page, comment_text)
+                if ok:
+                    print(f"[+] Comment posted: {comment_text!r}")
+                    break
+                else:
+                    print("[!] Post failed. Checking captcha or rate-limit...")
+                    await solve_simple_captcha_if_any(page)
+            except Exception as e:
+                print(f"[!] Error attempt {tries}: {e}")
+
+            backoff = min(60, (2 ** tries) + random.randint(0, 5))
+            print(f"    Backing off {backoff}s...")
+            await asyncio.sleep(backoff)
+        else:
+            print(f"[x] Give up on this comment: {comment_text!r}")
+
+from kafka import KafkaConsumer, KafkaProducer
+
+async def kafka_consume_forever(profile_id: str,
+                                bootstrap: str = KAFKA_BOOTSTRAP,
+                                topic: str = KAFKA_TOPIC,
+                                group_id: str = KAFKA_GROUP_ID,
+                                wait_login_sec: int = 90,
+                                max_retries: int = 2):
+    """
+    Chạy liên tục:
+      - Đọc job từ `topic` (schema: {"url": str, "comments": [str, ...]})
+      - Mỗi job: gửi toàn bộ comments cho video
+      - Kết quả:
+          * SUCCESS -> bắn vào PRODUCER_SUCCESS_TOPIC
+          * ERROR   -> bắn vào PRODUCER_ERROR_TOPIC
+    """
+    print("[*] Kafka connect:", bootstrap, "| topic:", topic, "| group:", group_id)
+
+    def make_consumer():
+        return KafkaConsumer(
+            topic,
+            bootstrap_servers=bootstrap,
+            group_id=group_id,
+            enable_auto_commit=True,
+            auto_offset_reset="latest",
+            value_deserializer=lambda v: json.loads(v.decode("utf-8", errors="ignore")),
+            key_deserializer=lambda v: v.decode("utf-8", errors="ignore") if v else None,
+            consumer_timeout_ms=10_000,   # 10s để có nhịp 'waiting...'
+        )
+
+    # Producer: đợi ACK đầy đủ (acks='all'); khi stop sẽ flush+close
+    producer = KafkaProducer(
+        bootstrap_servers=bootstrap,
+        acks='all',
+        retries=5,
+        linger_ms=0,
+        batch_size=32 * 1024,
+        value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode("utf-8"),
+    )
+
+    consumer = None
+    pw = browser = context = page = None
+
+    async def ensure_browser():
+        nonlocal pw, browser, context, page
+        if browser and browser.is_connected():
+            return
+        if pw:
+            try:
+                await pw.stop()
+            except Exception:
+                pass
+        pw, browser = await connect_gpm_v3_and_get_browser(profile_id)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        page = context.pages[0] if context.pages else await context.new_page()
+
+    try:
+        while True:
+            # đảm bảo consumer
+            if consumer is None:
+                try:
+                    consumer = make_consumer()
+                except Exception as e:
+                    print("[!] Kafka create consumer failed:", e)
+                    await asyncio.sleep(3)
+                    continue
+
+            # đảm bảo browser
+            try:
+                await ensure_browser()
+            except Exception as e:
+                print("[!] Ensure browser failed, retrying:", e)
+                await asyncio.sleep(3)
+                continue
+
+            got_any = False
+            try:
+                for msg in consumer:
+                    got_any = True
+                    try:
+                        payload = msg.value
+                        if not isinstance(payload, dict):
+                            print("[!] Skip: payload không phải JSON object:", payload)
+                            continue
+
+                        video_url = payload.get("url")
+                        comments  = payload.get("comments")
+                        if not video_url or not isinstance(comments, list) or not comments:
+                            print("[!] Skip: thiếu url hoặc comments rỗng:", payload)
+                            continue
+
+                        print(f"[*] New job: url={video_url} | comments={len(comments)}")
+
+                        # Xử lý: gửi toàn bộ comments theo thứ tự
+                        await process_one_video_with_comments(page, video_url, comments, wait_login_sec, max_retries)
+
+                        # SUCCESS payload theo format bạn yêu cầu
+                        result = {
+                            "reason": "Job success",
+                            "at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                            "payload": {
+                                "topic": msg.topic,
+                                "partition": msg.partition,
+                                "offset": str(msg.offset),
+                                "value": {
+                                    "url": video_url,
+                                    "comments": comments,
+                                },
+                            },
+                        }
+                        md = producer.send(PRODUCER_SUCCESS_TOPIC, value=result).get(timeout=10)
+                        print(f"[✓] Sent to {md.topic} p{md.partition} @offset {md.offset}: {result}")
+
+                    except Exception as e:
+                        # ERROR payload theo format tương tự
+                        err = {
+                            "reason": "Job failed",
+                            "at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+                            "payload": {
+                                "topic": msg.topic,
+                                "partition": msg.partition,
+                                "offset": str(msg.offset),
+                                "value": {
+                                    "url": payload.get("url"),
+                                    "comments": payload.get("comments") or [],
+                                },
+                            },
+                            "error": str(e),
+                        }
+                        try:
+                            md = producer.send(PRODUCER_ERROR_TOPIC, value=err).get(timeout=10)
+                            print(f"[x] Sent to {md.topic} p{md.partition} @offset {md.offset}: {err}")
+                        except Exception as pe:
+                            print("[!] FAILED to publish error result:", pe)
+
+                        # Nếu browser die -> reset để reconnect vòng sau
+                        try:
+                            if not browser.is_connected():
+                                print("[!] Browser disconnected. Will reconnect.")
+                                try:
+                                    await browser.close()
+                                except Exception:
+                                    pass
+                                try:
+                                    await pw.stop()
+                                except Exception:
+                                    pass
+                                pw = browser = context = page = None
+                        except Exception:
+                            pass
+
+                # Hết vòng for do timeout 10s -> không có message
+                # if not got_any:
+                #     print("[*] waiting for new message...")
+                # continue  # lặp tiếp
+
+            except KeyboardInterrupt:
+                print("[*] Stopping by user (Ctrl+C)")
+                break
+            except Exception as loop_err:
+                print("[!] Consumer loop error:", loop_err)
+                # reset consumer để tạo lại
+                try:
+                    consumer.close()
+                except Exception:
+                    pass
+                consumer = None
+                await asyncio.sleep(2)
+
+    finally:
+        # đảm bảo đẩy hết mọi message còn trong queue & đóng gọn gàng
+        try:
+            producer.flush()
+            producer.close()
+        except Exception:
+            pass
+        try:
+            if consumer:
+                consumer.close()
+        except Exception:
+            pass
+        try:
+            if browser:
+                await browser.close()
+        except Exception:
+            pass
+        if pw:
+            await pw.stop()
+
+if __name__ == "__main__":
+    # Giá trị mặc định (nếu không truyền args)
+    default_profile = "ddfdc3df-8a2f-40b4-b1ef-933b1802411d"
+    # default_video   = "https://www.tiktok.com/@elz.study/video/7554793319776128263"
+    # default_comment = "bóng đèn sáng hết hạn sử dụng"
+    default_max_retries = 2
+    default_wait_login  = 90
+
+    # Bật một trong hai chế độ:
+    # 1) Kafka mode (liên tục)
+    KAFKA_MODE = True
+
+    if KAFKA_MODE:
+        try:
+            asyncio.run(
+                kafka_consume_forever(
+                    profile_id=default_profile,
+                    bootstrap=KAFKA_BOOTSTRAP,   # 192.168.1.28:9092
+                    topic=KAFKA_TOPIC,           # tiktok-platforms
+                    group_id=KAFKA_GROUP_ID,     # tiktok-comment-bot
+                    wait_login_sec=default_wait_login,
+                    max_retries=default_max_retries
+                )
+            )
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+    else:
+        # 2) Single-run (test 1 job)
+        try:
+            asyncio.run(run(default_profile, default_video, default_comment, default_max_retries, default_wait_login))
+        except KeyboardInterrupt:
+            print("Interrupted by user")
