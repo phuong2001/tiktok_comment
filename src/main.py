@@ -40,7 +40,7 @@ PRODUCER_ERROR_TOPIC   = os.getenv("PRODUCER_ERROR_TOPIC", "comment_jobs_error")
 
 
 # ----------------------- Config -----------------------
-GPM_URL = os.getenv("GPM_URL", "http://127.0.0.1:19995")
+GPM_URL = os.getenv("GPM_URL", "http://127.0.0.1:16137")
 GPM_TOKEN = os.getenv("GPM_TOKEN")
 DEFAULT_WAIT_MS = 30000
 
@@ -388,7 +388,7 @@ async def kafka_consume_forever(profile_id: str,
                                 max_retries: int = 2):
     """
     Chạy liên tục:
-      - Đọc job từ `topic` (schema: {"url": str, "comments": [str, ...]})
+      - Đọc job từ `topic` (schema: {"url": str, "comments": [str, ...], "userId": int, "postId": [str, ...]})
       - Mỗi job: gửi toàn bộ comments cho video
       - Kết quả:
           * SUCCESS -> bắn vào PRODUCER_SUCCESS_TOPIC
@@ -401,14 +401,13 @@ async def kafka_consume_forever(profile_id: str,
             topic,
             bootstrap_servers=bootstrap,
             group_id=group_id,
-            enable_auto_commit=True,
+            enable_auto_commit=False,
             auto_offset_reset="latest",
             value_deserializer=lambda v: json.loads(v.decode("utf-8", errors="ignore")),
             key_deserializer=lambda v: v.decode("utf-8", errors="ignore") if v else None,
-            consumer_timeout_ms=10_000,   # 10s để có nhịp 'waiting...'
+            consumer_timeout_ms=10_000,
         )
 
-    # Producer: đợi ACK đầy đủ (acks='all'); khi stop sẽ flush+close
     producer = KafkaProducer(
         bootstrap_servers=bootstrap,
         acks='all',
@@ -436,7 +435,6 @@ async def kafka_consume_forever(profile_id: str,
 
     try:
         while True:
-            # đảm bảo consumer
             if consumer is None:
                 try:
                     consumer = make_consumer()
@@ -445,7 +443,6 @@ async def kafka_consume_forever(profile_id: str,
                     await asyncio.sleep(3)
                     continue
 
-            # đảm bảo browser
             try:
                 await ensure_browser()
             except Exception as e:
@@ -463,18 +460,21 @@ async def kafka_consume_forever(profile_id: str,
                             print("[!] Skip: payload không phải JSON object:", payload)
                             continue
 
-                        video_url = payload.get("url")
-                        comments  = payload.get("comments")
+                        value = payload.get("payload", {}).get("value", {}) if "payload" in payload else payload
+                        video_url = value.get("url")
+                        comments = value.get("comments")
+                        user_id = value.get("userId")
+                        post_ids = value.get("postId")
+
                         if not video_url or not isinstance(comments, list) or not comments:
                             print("[!] Skip: thiếu url hoặc comments rỗng:", payload)
                             continue
 
-                        print(f"[*] New job: url={video_url} | comments={len(comments)}")
+                        print(f"[*] New job: url={video_url} | comments={len(comments)} | userId={user_id} | postId={post_ids}")
 
-                        # Xử lý: gửi toàn bộ comments theo thứ tự
+                        # Gọi xử lý video (nếu cần truyền user_id, post_ids thì truyền thêm)
                         await process_one_video_with_comments(page, video_url, comments, wait_login_sec, max_retries)
 
-                        # SUCCESS payload theo format bạn yêu cầu
                         result = {
                             "reason": "Job success",
                             "at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
@@ -485,14 +485,17 @@ async def kafka_consume_forever(profile_id: str,
                                 "value": {
                                     "url": video_url,
                                     "comments": comments,
+                                    "userId": user_id,
+                                    "postId": post_ids,
                                 },
                             },
                         }
                         md = producer.send(PRODUCER_SUCCESS_TOPIC, value=result).get(timeout=10)
                         print(f"[✓] Sent to {md.topic} p{md.partition} @offset {md.offset}: {result}")
 
+                        consumer.commit()
+
                     except Exception as e:
-                        # ERROR payload theo format tương tự
                         err = {
                             "reason": "Job failed",
                             "at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
@@ -501,8 +504,10 @@ async def kafka_consume_forever(profile_id: str,
                                 "partition": msg.partition,
                                 "offset": str(msg.offset),
                                 "value": {
-                                    "url": payload.get("url"),
-                                    "comments": payload.get("comments") or [],
+                                    "url": video_url,
+                                    "comments": comments,
+                                    "userId": user_id,
+                                    "postId": post_ids,
                                 },
                             },
                             "error": str(e),
@@ -510,10 +515,11 @@ async def kafka_consume_forever(profile_id: str,
                         try:
                             md = producer.send(PRODUCER_ERROR_TOPIC, value=err).get(timeout=10)
                             print(f"[x] Sent to {md.topic} p{md.partition} @offset {md.offset}: {err}")
+
+                            consumer.commit()
                         except Exception as pe:
                             print("[!] FAILED to publish error result:", pe)
 
-                        # Nếu browser die -> reset để reconnect vòng sau
                         try:
                             if not browser.is_connected():
                                 print("[!] Browser disconnected. Will reconnect.")
@@ -529,17 +535,15 @@ async def kafka_consume_forever(profile_id: str,
                         except Exception:
                             pass
 
-                # Hết vòng for do timeout 10s -> không có message
                 # if not got_any:
                 #     print("[*] waiting for new message...")
-                # continue  # lặp tiếp
+                # continue
 
             except KeyboardInterrupt:
                 print("[*] Stopping by user (Ctrl+C)")
                 break
             except Exception as loop_err:
                 print("[!] Consumer loop error:", loop_err)
-                # reset consumer để tạo lại
                 try:
                     consumer.close()
                 except Exception:
@@ -548,7 +552,6 @@ async def kafka_consume_forever(profile_id: str,
                 await asyncio.sleep(2)
 
     finally:
-        # đảm bảo đẩy hết mọi message còn trong queue & đóng gọn gàng
         try:
             producer.flush()
             producer.close()
@@ -567,9 +570,10 @@ async def kafka_consume_forever(profile_id: str,
         if pw:
             await pw.stop()
 
+
 if __name__ == "__main__":
     # Giá trị mặc định (nếu không truyền args)
-    default_profile = "ddfdc3df-8a2f-40b4-b1ef-933b1802411d"
+    default_profile = "479c1c60-192e-490b-a10e-7f3efc62aeb7"
     # default_video   = "https://www.tiktok.com/@elz.study/video/7554793319776128263"
     # default_comment = "bóng đèn sáng hết hạn sử dụng"
     default_max_retries = 2

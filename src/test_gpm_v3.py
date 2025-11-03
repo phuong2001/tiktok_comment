@@ -1,6 +1,6 @@
 import os, requests, json
 
-GPM_URL = os.getenv("GPM_URL", "http://127.0.0.1:19995")  # đúng theo Node cũ của bạn
+GPM_URL = os.getenv("GPM_URL", "http://127.0.0.1:16137")  # đúng theo Node cũ của bạn
 GPM_TOKEN = os.getenv("GPM_TOKEN")  # nếu có token, set env trước
 
 def try_get(url, headers=None):
